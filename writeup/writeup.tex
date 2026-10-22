@@ -1,0 +1,417 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+\lstset{basicstyle=\ttfamily\small, breaklines=true, columns=fullflexible, frame=single}
+\setlist{itemsep=2pt, topsep=4pt}
+
+% Results that can only be produced on the Together cluster / GPUs
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+\newcommand{\deliv}[1]{\par\noindent\textbf{#1}\par}
+
+\title{CS336 Assignment 4 (data): Filtering Language Modeling Data\\\large Writeup}
+\author{Pengcheng Zhou}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent Unless noted otherwise, all experiments use the sample crawl file
+\texttt{CC-MAIN-20250417135010-20250417165010-00065} (WARC and WET). Every number
+below was produced by a script in \texttt{scripts/}, named in each answer, so it can be reproduced.
+
+%======================================================================
+\section{Looking at the data}
+
+\subsection*{Problem (look\_at\_cc)}
+
+\paragraph{(a)}
+The first \texttt{response} record is \texttt{http://0371rykj.com/ipfhsb/34.html}
+(the very first record of the file is a \texttt{warcinfo} record, which has no URL).
+The page is no longer accessible; the connection fails today. The raw HTML
+hides its title, keywords and description behind numeric character references
+(\texttt{\&\#x4EBA;\&\#x59BB;...}). Decoded, they turn out to be Chinese pornographic
+spam keywords, while the body is the product page of a Shanghai company that sells
+temperature/humidity test chambers. So this is an SEO-hijacked company site.
+
+\paragraph{(b)}
+The WET text begins with two lines of the injected pornographic keywords, followed by the
+whole navigation menu (home, products, case studies, news, contact\ldots), a hotline phone
+number, breadcrumbs, and then a product specification table flattened into one cell per
+line (characters of headers such as ``performance indicators'' even appear one per line).
+The extractor should have dropped the injected keywords, the menus, the contact boilerplate
+and the broken table layout. A model trained on such text learns to emit spam keywords and
+disconnected menu fragments, and it learns PII such as phone numbers. It may also
+associate legitimate product content with pornographic terms. On the other hand, the page
+does contain genuinely useful domain text: a description of what the chamber is used for
+and real technical parameters (temperature range 0--150\,$^\circ$C, humidity 20--98\% RH,
+materials).
+
+\paragraph{(c)}
+The product specifications could be useful for a Chinese-language model in an
+industrial / e-commerce domain (for example, answering questions about lab equipment). It is
+clearly harmful for a general-purpose or English assistant, and for any user-facing
+product, because of the injected pornographic spam.
+
+\paragraph{(d)} Annotations of WET records 1--25 (record 0 is the page discussed above).
+Language comes from my own reading, confirmed by fastText.
+
+\begin{small}
+\begin{tabularx}{\linewidth}{@{}rllX@{}}
+\toprule
+\# & Lang & Domain & Notes \\
+\midrule
+1 & zh & chinatikfans.com & Discuz! fan-club forum blog page; almost all login/nav boilerplate. \\
+2 & en & 13.usnccm.org & Homepage of an academic conference (computational mechanics); some real info, much menu. \\
+3 & zh & utchat888.com & Adult live-video chat site; spam, phone numbers. \\
+4 & zh & 176766.cn & Pornographic keyword injection on top of a company site. \\
+5 & zh & 178mh.com & Two words: ``template does not exist''; broken page. \\
+6 & zh & tgtg97.com & Adult live-stream site, same template as \#3. \\
+7 & zh & v340.info & Adult video site. \\
+8 & nl & klimtoren.be & Kindergarten class blog post (``Hoera voor Leonie!''); tiny but genuine. \\
+9 & el & mysch.gr & Greek school helpdesk forum, search page; boilerplate. \\
+10 & el & mysch.gr & Same forum, login page. \\
+11 & zh & yhxzseo.com & SEO spam for a betting app mixed with a scraped IT-news article. \\
+12 & tr & 20com20.fr & Apache HTTP Server documentation sitemap (Turkish); a list of links. \\
+13 & en & 24ktcasino.net & Casino ``tips'' blog post; SEO spam. \\
+14 & -- & 2kgames.eu & ``404 Not Found / nginx''; fastText guesses da with 0.44. \\
+15 & zh & yizhangting.com & Lottery/gambling spam over a health-portal template. \\
+16 & zh & 303323.com & Company news article about electrosurgical cutters plus nav; mediocre. \\
+17 & zh & 30bad.com & Pirate video-streaming page. \\
+18 & zh & 312001.net & Community health center site, news list page; mostly nav. \\
+19 & zh & mwe075.com & Adult video chat site. \\
+20 & en & schoollibrary.edu.pe.ca & Library catalog search results (Koha); metadata only. \\
+21 & zh & haaxz.com & Adult video site. \\
+22 & zh & haaxz.com & Same site, another page (near duplicate of \#21). \\
+23 & zh & 387tel.com & Adult video chat site. \\
+24 & es & 3diasdemarzo.blogspot.com & Spanish political/news blog post with real prose; \textbf{first high-quality page}. \\
+25 & da & 3godetilbud.dk & Danish lead-generation page for window cleaning; templated SEO text. \\
+\bottomrule
+\end{tabularx}
+\end{small}
+
+\noindent It took \textbf{24} records before I saw a page I would consider high quality (\#24).
+The first English page with real content (\#2) is mostly navigation. Ten of the 25 pages are
+adult or gambling spam, which shows how much filtering the raw crawl needs.
+
+%======================================================================
+\section{HTML to text conversion}
+
+\subsection*{Problem (extract\_text)}
+
+\paragraph{(a)} \texttt{cs336\_data/extract.py}: \texttt{extract\_text\_from\_html\_bytes} detects the
+encoding with \texttt{resiliparse.parse.encoding.detect\_encoding}, decodes with
+\texttt{errors="replace"}, and calls \texttt{extract\_plain\_text}. The test passes.
+
+\paragraph{(b)} (\texttt{scripts/compare\_warc\_wet.py}, which matches WARC responses to WET
+records by URL; 489 of 500 matched.) Both extractions contain essentially the same main
+text, and both keep navigation menus, sidebars and footers. Resiliparse preserves structure:
+list bullets (\texttt{\textbullet}), indentation, blank lines between paragraphs, and image
+alt text. WET is completely flat (one block per line, whitespace collapsed), includes the
+page \texttt{<title>} as its first line, and is a bit shorter (for example, 3643 vs.\ 4731 characters).
+I find the Resiliparse output slightly better, because paragraph structure is useful for
+line-level filtering and deduplication. Neither extraction removes boilerplate;
+\texttt{main\_content=True} would be needed for that.
+
+%======================================================================
+\section{Language identification}
+
+\subsection*{Problem (language\_identification)}
+
+\paragraph{(a)} \texttt{cs336\_data/language\_identification.py}: \texttt{identify\_language} runs
+\texttt{lid.176.bin} on the text with newlines replaced by spaces (fastText rejects
+\texttt{\textbackslash n}), strips the \texttt{\_\_label\_\_} prefix and clips the score to $[0,1]$.
+Both tests pass.
+
+\paragraph{(b)}
+Language-ID errors silently remove data in low-resource languages, dialects and
+code-switched text, so the model becomes weaker and less fair for those users. Meanwhile,
+non-language content (boilerplate, code, empty pages) that gets labeled ``English'' leaks
+noise into the training set. A single page-level label also hides mixed-language pages, so
+content can be kept or dropped for the wrong reason. In a high-stakes deployment I would use
+per-language thresholds, classify at the paragraph level, combine several classifiers with
+simple script/character-set checks, and regularly have humans audit samples per language
+while tracking downstream quality per language.
+
+\paragraph{(c)} (\texttt{scripts/langid\_warc.py}, first 2000 HTML responses.)
+34.1\% of documents are English (zh 22.9\%, ru 8.5\%, ja 5.1\%). In 20 random samples, the only
+clear error was an \emph{empty} extracted page predicted as \texttt{en} with score 0.110. One
+page mixing a Spanish navigation bar with English casino spam was labeled \texttt{en} (0.83),
+which is defensible but lossy. Low-score predictions (0.4--0.7) were mostly correct but
+had little natural language: navigation-heavy shops, file-name lists, a two-word login page,
+code documentation. A threshold of about 0.5 removes garbage like the empty page and keeps
+85.5\% of pages. For training data I use 0.65 (77.6\% kept), which also removes very thin
+pages.
+
+%======================================================================
+\section{Personal identifiable information}
+
+\subsection*{Problem (mask\_pii)}
+
+\paragraph{1--3.} \texttt{cs336\_data/pii.py}: \texttt{mask\_emails}, \texttt{mask\_phone\_numbers}
+(common US formats, optional country code and separators) and \texttt{mask\_ips} (IPv4, each octet
+0--255 without leading zeros, not embedded in a longer dotted number). Each returns
+\texttt{(text, count)} via \texttt{re.subn}. All tests pass. Masks should be applied in the order
+email $\rightarrow$ phone $\rightarrow$ IP, because a QQ e-mail such as \texttt{3007542130@qq.com}
+also matches the phone regex.
+
+\paragraph{4.}
+False positives destroy useful content: version strings (\texttt{0.19.8.1}), example subnets in
+networking tutorials, and Chinese ICP registration numbers get masked, so the model learns
+wrong patterns for technical text. False negatives (international phone formats) leave real
+PII in the data. The mask tokens themselves become frequent strings that the model may emit
+verbatim, and the model never learns what a well-formed e-mail or IP address looks like. Mitigations:
+replace PII with realistic but fake surrogates instead of a fixed token; use locale-aware
+rules or an NER-based PII detector; use context (for example, \texttt{ver=}, ``Your IP:'');
+allow-list public business contacts; and measure precision and recall on a hand-labeled sample.
+
+\paragraph{5.} (\texttt{scripts/pii\_warc.py}, 3000 pages: 1293 e-mails on 685 pages, 1789 phone
+numbers on 590 pages, 281 IPs on only 29 pages.)
+\emph{False positives:} the IP regex matched version numbers (\texttt{gettext\_0.19.8.1},
+``Open Journal System 2.4.7.1''), tutorial subnets (\texttt{1.1.1.0/24}), Docker addresses
+(\texttt{172.17.0.1}) and the crawler's own address shown on a ``Your IP'' widget. The
+phone regex matched 10-digit Chinese ICP licence numbers.
+\emph{False negatives:} international phone numbers (German \texttt{+49 89 1500 15 4500}, Polish
+\texttt{602 25 35 35}, Chinese landlines such as \texttt{021-59556573}) were missed, and
+\texttt{+44 (0) 208 395 0333} was only partially masked. E-mail masking looked precise, but
+most matches were public business addresses (\texttt{info@}, \texttt{support@}).
+
+%======================================================================
+\section{Harmful content}
+
+\subsection*{Problem (harmful\_content)}
+
+\paragraph{1--2.} \texttt{cs336\_data/harmful\_content.py}: \texttt{classify\_nsfw} and
+\texttt{classify\_toxic\_speech} wrap the Dolma Jigsaw fastText models. The models are loaded
+lazily and cached, since each is about 1\,GB. Labels are \texttt{nsfw}/\texttt{non-nsfw} and
+\texttt{toxic}/\texttt{non-toxic}. Both tests pass.
+
+\paragraph{3.}
+The classifiers were trained on English Wikipedia comments, so they tend to flag dialects
+(for example, African-American English) and identity terms (``gay'', ``Muslim'') as toxic.
+Filtering then under-represents those communities, and the model becomes worse at discussing
+them. Harmful content in other languages passes through, and a model that never sees harmful
+text cannot learn to recognize or respond to it. Mitigations: use high thresholds; audit
+removed data per language and per demographic term; use multilingual classifiers; and
+down-weight or tag such documents (conditional training) instead of deleting them outright.
+
+\paragraph{4.} (\texttt{scripts/harmful\_warc.py}, 2000 pages.) With a 0.5 cutoff, 1.1\% of all
+pages and 2.2\% of English pages are flagged as harmful (NSFW or toxic). The true rate is far
+higher. Among 20 random pages, the classifiers called everything benign, but three were
+clearly NSFW: an English porn site (non-nsfw, 0.999) and two Chinese adult/spam pages
+(non-nsfw, 1.000). Among flagged pages, porn sites were mostly caught by the \emph{toxic}
+model rather than the NSFW one. False positives were mainly benign non-English pages
+(Czech church portal 0.75, Hungarian government site 0.51, Swiss school association 0.75, Serbian
+consulate 0.95) and one English fashion portfolio (0.85). Most false positives score
+0.5--0.75 while true positives are mostly $\geq 0.9$, so I use \textbf{0.9} for both
+classifiers and apply them after the English-only filter.
+
+%======================================================================
+\section{Quality rules}
+
+\subsection*{Problem (gopher\_quality\_filters)}
+
+\paragraph{(a)} \texttt{cs336\_data/quality\_filters.py}: \texttt{gopher\_quality\_filter} checks
+word count (50 to 100{,}000), mean word length (3 to 10), the fraction of lines ending in an
+ellipsis ($\leq 30\%$), and the fraction of words containing a letter ($\geq 80\%$). Words come from
+whitespace \texttt{split()}, as in Gopher. All 7 tests pass. \texttt{nltk.word\_tokenize} also
+passes them, but it turns every punctuation mark into a non-alphabetic ``word''. That halves the
+pass rate on real pages (20.8\% vs.\ 40.6\%) and runs about 10$\times$ slower.
+
+\paragraph{(b)} (\texttt{scripts/gopher\_warc.py}, 2000 pages.) 40.6\% of pages pass (48.8\%
+of English pages). The filter disagreed with my judgment in several ways.
+(i) It \emph{passes} casino spam, a cannabis shop, a porn page and a mojibake Russian forum,
+because it only checks form, not content.
+(ii) It \emph{rejects} a good Chinese technical blog and a Japanese film blog, because CJK text
+has no spaces and therefore produces a few very long ``words''.
+(iii) 68\% of the \texttt{alpha\_words} rejections (485 of 709) were caused by the
+\texttt{\textbullet} list bullets that Resiliparse inserts, which count as non-alphabetic
+words. So the filter is sensitive to the extraction format. Empty pages and two-word login
+pages were correctly rejected, and normal English articles passed.
+
+%======================================================================
+\section{Quality classifier}
+
+\subsection*{Problem (quality\_classifier)}
+
+\paragraph{(a)} Data (\texttt{scripts/sample\_urls.py}, \texttt{scripts/fetch\_urls.sh},
+\texttt{scripts/build\_quality\_dataset.py}):
+\begin{itemize}
+  \item I reservoir-sampled 5000 URLs from the 43.5M Wikipedia external links and fetched them with
+  parallel \texttt{wget}. This yielded 2668 status-200 HTML pages. DNS throttling under parallel fetching
+  cost about 600 URLs. wget stores raw chunked transfer encoding, which I had to decode before extraction.
+  \item \textbf{Positives} (\texttt{\_\_label\_\_wiki}): pages that are English with score $\geq 0.65$ (removes 30.5\%), pass Gopher
+  (removes 8.5\%), and score below 0.9 on both harmful classifiers. 1626 pages remain.
+  \item \textbf{Negatives} (\texttt{\_\_label\_\_cc}): 1626 English pages with at least 50 words from the Common Crawl WARC.
+  Restricting negatives to English makes the classifier learn quality rather than language.
+  \item PII is masked in both classes. Each example is one line; 90/10 train/validation split (2927/325).
+\end{itemize}
+I trained a fastText supervised model (\texttt{scripts/train\_quality\_classifier.py}) with
+\texttt{epoch=10}, \texttt{lr=0.5}, \texttt{wordNgrams=2}, \texttt{dim=100}, and
+\texttt{bucket=200000}. Reducing the bucket count shrank the model from 909\,MB to 217\,MB with
+no loss in accuracy. Validation accuracy is \textbf{88.3\%}: wiki precision/recall
+0.825/0.938, cc precision/recall 0.943/0.838. The numeric quality score is
+\texttt{quality\_score(text)} $=P(\texttt{wiki}\mid\text{text})$.
+
+\paragraph{(b)} \texttt{cs336\_data/quality\_classifier.py}: \texttt{classify\_quality} returns
+\texttt{("wiki"|"cc", confidence)}. On the test fixtures it returns \texttt{("cc", 0.990)} and
+\texttt{("wiki", 0.842)}. The test passes.
+
+%======================================================================
+\section{Deduplication}
+
+\subsection*{Problem (exact\_deduplication)}
+\texttt{cs336\_data/exact\_deduplication.py}. The first pass counts every line across all files,
+keyed by its 16-byte MD5 digest, so memory does not grow with line length. The second pass
+rewrites each file to the output directory under the same name, keeping only lines whose
+count is 1. Files are read as bytes, so no decoding is needed. The test passes.
+
+\subsection*{Problem (minhash\_deduplication)}
+\texttt{cs336\_data/minhash\_deduplication.py}:
+\begin{enumerate}
+  \item Normalize text: NFD, strip combining marks (accents), lowercase, replace Unicode
+  punctuation with spaces, collapse whitespace. Build the set of word $n$-grams.
+  \item The signature is $\min_g h_i(g)$ for $i=1..k$, where $h_i$ is MurmurHash3 with seed $i$.
+  \item LSH: split the signature into $b$ bands of $r=k/b$ rows. Documents whose rows agree in
+  any band share a bucket, and every pair in a bucket becomes a candidate.
+  \item Compute the true $n$-gram Jaccard similarity for each candidate pair and keep pairs at or above the threshold.
+  \item Union-find merges duplicate pairs into clusters (so that $A\approx B$ and $B\approx C$ gives one cluster). One
+  document per cluster is kept and copied byte-for-byte to the output directory.
+\end{enumerate}
+Both MinHash tests pass (all 21 tests pass).
+
+%======================================================================
+\section{Leaderboard: filtering data for language modeling}
+
+\subsection*{Problem (filter\_data)}
+
+\paragraph{(a)} The pipeline consists of three scripts:
+\begin{enumerate}
+  \item \texttt{scripts/filter\_wet.py} runs one task per WET file, either with \texttt{ProcessPoolExecutor}
+  locally or as a submitit Slurm job array with \texttt{--slurm}. Filters run cheapest first:
+  \begin{enumerate}
+    \item \textbf{language}: English with fastText score $\geq 0.65$.
+    \item \textbf{c4\_rules} (\texttt{cs336\_data/c4\_filters.py}), which reproduces C4's own cleaning because the target is C4.
+    It keeps only lines that end in terminal punctuation, have at least 5 words, and contain neither ``javascript'' nor
+    cookie/privacy-policy phrases. It drops pages containing ``lorem ipsum'' or \texttt{\{}, and pages left with fewer
+    than 3 sentences.
+    \item \textbf{gopher} rules applied to the cleaned text.
+    \item \textbf{harmful}: NSFW or toxic with score $\geq 0.9$.
+    \item (optional) the quality classifier.
+  \end{enumerate}
+  Each task returns per-filter counters, which are summed and printed. A 1\% sample of removed and modified
+  documents is saved for inspection.
+  \item \texttt{scripts/dedup\_filtered.py} performs corpus-wide MinHash+LSH ($k=100$, $b=10$, 5-grams). To scale to tens of
+  millions of documents, workers return only one 64-bit key per band per document, about 80\,bytes per
+  document. Signatures use one MurmurHash per $n$-gram mixed with $k$ seeds (splitmix64). Documents sharing any
+  band key are clustered with union-find, and the first document of each cluster is kept.
+  \item \texttt{scripts/tokenize\_filtered.py} tokenizes (see below).
+\end{enumerate}
+
+\noindent Results on the local WET file (27{,}173 documents):
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+Filter & Removed & \% of all removed & \% of docs reaching it \\
+\midrule
+language (not en: 15{,}248; low score: 2{,}603) & 17{,}851 & 84.6\% & 65.7\% \\
+c4\_rules (too few sentences: 1{,}623; \texttt{\{}: 416; lorem ipsum: 44) & 2{,}083 & 9.9\% & 22.3\% \\
+gopher (word count: 769; ellipsis: 378; alpha: 13; word len: 2) & 1{,}162 & 5.5\% & 16.1\% \\
+harmful (nsfw: 6; toxic: 3) & 9 & 0.04\% & 0.1\% \\
+\midrule
+\multicolumn{4}{l}{Kept after filtering: 6{,}068 (22.3\% of documents, 11.7\% of characters)} \\
+\multicolumn{4}{l}{MinHash dedup: removed 181 (3.0\%), kept 5{,}887} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\todo{Replace with the numbers printed by \texttt{filter\_wet.py} and \texttt{dedup\_filtered.py} on all 5000
+WET files. Cross-file dedup will remove a much larger share than the within-file 3.0\%.}
+
+\paragraph{(b)} One WET file takes 11.1\,s on a single core (Apple Silicon, all models loaded). This is
+about 15.4 CPU-hours for 5000 files, or roughly 1 hour with 16 parallel Slurm tasks. A full
+Common Crawl dump (100{,}000 WETs) would take about 310 CPU-hours: roughly 19 hours at 16-way
+parallelism, or about 1.2 hours on 256 cores. The deduplication pass took 4\,s per file and its
+cost is linear in the number of documents.
+\todo{Report the measured wall-clock time on the cluster.}
+
+\subsection*{Problem (inspect\_filtered\_data)}
+
+\paragraph{(a)} Five random documents from the final (filtered + deduplicated) data:
+\begin{enumerate}
+  \item \emph{support.opendoorerp.com}: a troubleshooting article for scheduling Jet Analytics packages (``Ensure the
+  execution plan has been ran once successfully as the user assigned to the Jet Scheduler Service.'').
+  It is real instructional prose with a little help-desk boilerplate (``Sorry we couldn't be helpful.''). Worthwhile.
+  \item \emph{used{-}{-}equipment.com}: a listing for a used stainless mixing tank, written as one long comma-separated
+  specification line (``316L Stainless Shell, 304 Stainless Jacket, \ldots''). It is English but not prose, and of marginal value.
+  \item \emph{4perthpestcontrol.com.au}: local-business SEO copy about spider control (``Our spider control Bedford
+  services are very efficient\ldots''). It is fluent and repetitive, which is exactly the commercial register common in C4.
+  Worthwhile for this benchmark.
+  \item \emph{londonspiritscompetition.com}: short tasting notes for spirits (``A rum with flavors and aromas of
+  lemongrass, herbs\ldots''). The sentences are fluent but templated, and one login line (``please click here and register
+  first.'') survived. Acceptable.
+  \item \emph{duringdays.com.au}: a Shopify product page. The text is dominated by Shopify boilerplate (``This item is a
+  recurring or deferred purchase. By continuing, I agree to the cancellation policy\ldots'') that appears on thousands of
+  shops. It passes every filter because the sentences are well formed, and survives document-level dedup because the product
+  text differs. It is low value and motivates line-level dedup (see (c)).
+\end{enumerate}
+
+\paragraph{(b)} Five sampled removed or modified documents:
+\begin{enumerate}
+  \item \emph{farm24.hu} (language, not English): a Hungarian farm-supply shop category page. Removal is justified.
+  \item \emph{commesi.com} (c4\_rules, too few sentences): a clothing collection page consisting only of menu items (``Socks / Best
+  Sellers / Sets / Egyptian Cotton / \ldots''). Removal is justified.
+  \item \emph{theoutlookmirror.com} (gopher, ellipsis lines): an Indian news site. After C4 cleaning, 92 of its 133 lines are
+  repeated truncated teasers (``Jaipur (Rajasthan), April 16: Founded on a passion\ldots''). Removal is justified, although the
+  article itself was lost along with the teasers.
+  \item \emph{libcat.emmanuel.edu} (harmful, toxic 0.97): a college library catalog record for a medical video, ``Auscultation of
+  breath sounds''. This is a clear false positive. The page is short and repetitive, so it is low value anyway, but the toxic
+  classifier is unreliable on such short, unusual text.
+  \item \emph{trustyspotter.com} (modified by c4\_rules): a fitness blog post. The title, the doubled menu (``Blog / Gym Reviews /
+  Workout Reviews / About / Contact'') and the byline were stripped, and the article body (``No matter how you slice it, cardio is
+  hard work.'') was kept intact. The modification is justified.
+\end{enumerate}
+
+\paragraph{(c)} Iterations so far:
+\begin{itemize}
+  \item \textbf{Fixed a MinHash hashing bug.} My first scalable implementation derived the $k$ hash functions as
+  $(a\cdot h + b) \bmod (2^{61}-1)$ with 32-bit $a$ and $h$. Because $a\cdot h + b$ stays far below a few multiples of the prime,
+  the modulus rarely wraps, so every ``hash function'' preserved roughly the same ordering of $n$-grams and the 100 minima
+  were highly correlated. Spot checks showed removed documents whose true Jaccard with the kept document was as low as 0.0
+  (median 0.76). After switching to a splitmix64 mix of \texttt{(h + seed)}, the median true Jaccard of removed pairs is 1.0
+  (minimum 0.58), and the removal rate dropped from 4.0\% to 3.0\%. The remaining sub-0.8 pairs match the LSH S-curve and are
+  same-site template pages.
+  \item \textbf{Corrected the C4 rules.} C4 keeps lines with at least 5 words and pages with at least 3 sentences.
+  \item \textbf{Observed but not yet applied}: (i) corpus-wide exact line dedup (the exact-dedup primitive) would remove
+  e-commerce boilerplate such as the Shopify text in (a)5. (ii) The toxic classifier's false positives on short pages suggest
+  applying it only to pages above a minimum length. (iii) A fastText classifier with Paloma C4-100-domains text as positives and
+  filtered CC as negatives would target the benchmark distribution directly; this is allowed because validation text is used
+  only to train the filter.
+\end{itemize}
+\todo{Describe the data iterations actually trained on the cluster and their validation losses.}
+
+\subsection*{Problem (tokenize\_data)}
+\texttt{scripts/tokenize\_filtered.py} tokenizes each filtered \texttt{.jsonl.gz} file in a worker process
+with the fast GPT-2 tokenizer, appends \texttt{<|endoftext|>} (id 50256) after every document, and writes
+\texttt{np.uint16} arrays to a single \texttt{.bin} with \texttt{tofile}, in input order. The local WET
+file yields \textbf{4{,}418{,}050 tokens} (5{,}887 documents). Extrapolated, 5000 WETs would give about 22B tokens
+before cross-file deduplication.
+\todo{Total token count of the full filtered dataset.}
+
+\subsection*{Problem (train\_model)}
+\todo{Set \texttt{paths.train\_bin} and the wandb attributes in \texttt{cs336-basics/configs/experiment/your\_data.yaml}, run
+\texttt{uv run torchrun --standalone --nproc\_per\_node=2 scripts/train.py --config-name=experiment/your\_data}, and report the
+best validation loss on C4 100 domains, the learning curve (wandb screenshot), and the data pipeline used.}
+
+\end{document}
